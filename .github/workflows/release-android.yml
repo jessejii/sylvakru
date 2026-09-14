@@ -2,6 +2,9 @@ name: Release Android
 
 on:
   push:
+    # pubspec.yaml 改了 → 自动建/复用 tag → 发布
+    branches: [main]
+    paths: ['pubspec.yaml']
     tags: ['v*']
   workflow_dispatch:
 
@@ -16,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-java@v4
         with:
@@ -30,6 +35,26 @@ jobs:
           cache: true
 
       - run: flutter pub get
+
+      # pubspec.yaml 改了 main → 自动按 version 建 tag v<x.y.z>，已存在则直接 checkout。
+      # 老的 "git push origin vx.y.z" 触发依然兼容（tags 触发的路径里这里只会走 exists 分支）。
+      - name: Auto-tag
+        id: ver
+        run: |
+          VER=$(grep '^version:' pubspec.yaml | sed -E 's/^version:[[:space:]]*//' | tr -d '\r')
+          NAME=$(echo "$VER" | cut -d+ -f1)
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          git fetch --tags
+          TAG="v$NAME"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "exists"
+            git checkout "$TAG"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
 
       # 签名密钥（可选）。在仓库 Settings → Secrets 配置：
       #   ANDROID_KEYSTORE_BASE64   = base64 -w0 android/sylvakru-release.jks
@@ -49,7 +74,6 @@ jobs:
       - run: flutter build apk --release --split-per-abi
 
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: build/app/outputs/flutter-apk/*.apk
