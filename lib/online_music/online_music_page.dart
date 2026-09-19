@@ -5,8 +5,10 @@
 // 因此不会有第二个播放器实例，也能拿到系统媒体通知。
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:audio_tags_lofty/audio_tags_lofty.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:sylvakru/base/app.dart';
@@ -128,7 +130,8 @@ class _OnlineMusicPageState extends State<OnlineMusicPage> {
 
   String _sourceFilter = 'all';
 
-  /// source -> 可用音质，来自聚合接口的 init.conf。拿不到就退回歌曲自带的。
+  /// source -> 可用音质，来自自定义源脚本的 `lx.send('inited')`。
+  /// 拿不到就退回歌曲自带的。
   Map<String, List<String>> _apiSources = const {};
 
   /// 正在解析直链的曲目 id。
@@ -148,7 +151,7 @@ class _OnlineMusicPageState extends State<OnlineMusicPage> {
     await onlineDownloader.init();
     if (!mounted) return;
     setState(() {});
-    await _loadApiSources();
+    await _loadScriptSources();
   }
 
   @override
@@ -157,14 +160,14 @@ class _OnlineMusicPageState extends State<OnlineMusicPage> {
     super.dispose();
   }
 
-  Future<void> _loadApiSources() async {
-    final bases = onlineSettings.orderedBases;
-    if (bases.isEmpty) return;
+  /// 跑一遍脚本（或复用已加载的），把脚本声明的音源与音质拿来过滤音质选择。
+  Future<void> _loadScriptSources() async {
+    if (!onlineSettings.hasScript) return;
     try {
-      final sources = await onlineApiClient.fetchSources(bases.first);
+      final sources = await onlineApiClient.fetchSources();
       if (mounted) setState(() => _apiSources = sources);
     } catch (e) {
-      logger.output('[online] init.conf 读取失败: $e');
+      logger.output('[online] 自定义源脚本加载失败: $e');
     }
   }
 
@@ -422,10 +425,10 @@ class _OnlineMusicPageState extends State<OnlineMusicPage> {
             style: TextStyle(fontSize: 22, fontWeight: FontWeight.w600),
           ),
           const SizedBox(width: 14),
-          Expanded(child: _buildBaseLabel()),
+          Expanded(child: _buildScriptLabel()),
           const _DownloadIndicator(),
           IconButton(
-            tooltip: '接口设置',
+            tooltip: '音源设置',
             onPressed: _openSettings,
             icon: const Icon(Icons.tune_rounded),
           ),
@@ -445,38 +448,28 @@ class _OnlineMusicPageState extends State<OnlineMusicPage> {
     );
   }
 
-  Widget _buildBaseLabel() {
-    return ValueListenableBuilder<List<String>>(
-      valueListenable: onlineSettings.bases,
-      builder: (context, bases, _) {
-        return ValueListenableBuilder<int>(
-          valueListenable: onlineSettings.selected,
-          builder: (context, selected, _) {
-            final base = bases.isEmpty
-                ? '未配置'
-                : bases[selected.clamp(0, bases.length - 1)];
-            return Tooltip(
-              message: base,
-              child: InkWell(
-                onTap: _openSettings,
-                borderRadius: BorderRadius.circular(8),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
-                    vertical: 4,
-                  ),
-                  child: Text(
-                    base,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 12,
-                      color: OnlinePalette.textFaint,
-                    ),
-                  ),
+  Widget _buildScriptLabel() {
+    return ValueListenableBuilder<String>(
+      valueListenable: onlineSettings.scriptName,
+      builder: (context, name, _) {
+        final label = name.isEmpty ? '未导入自定义源' : name;
+        return Tooltip(
+          message: label,
+          child: InkWell(
+            onTap: _openSettings,
+            borderRadius: BorderRadius.circular(8),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              child: Text(
+                label,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 12,
+                  color: OnlinePalette.textFaint,
                 ),
               ),
-            );
-          },
+            ),
+          ),
         );
       },
     );
@@ -725,8 +718,8 @@ class _OnlineMusicPageState extends State<OnlineMusicPage> {
         return _EmptyState(
           searching: _searching,
           isPlaylist: false,
-          hint: onlineSettings.bases.value.isEmpty
-              ? '接口未配置：搜索仍可使用，但播放需在「接口设置」中填写洛雪音乐接口地址'
+          hint: !onlineSettings.hasScript
+              ? '未导入自定义源：搜索仍可使用，但播放需在「音源设置」里导入洛雪音乐自定义源脚本（.js）'
               : null,
         );
       }
@@ -1876,34 +1869,38 @@ class _SettingsDialog extends StatefulWidget {
 }
 
 class _SettingsDialogState extends State<_SettingsDialog> {
-  final TextEditingController _newBase = TextEditingController();
+  bool _importing = false;
 
-  @override
-  void dispose() {
-    _newBase.dispose();
-    super.dispose();
-  }
-
-  void _addBase(String value) {
-    final base = value.trim().replaceAll(RegExp(r'/+$'), '');
-    if (base.isEmpty) return;
-    final list = List<String>.from(onlineSettings.bases.value);
-    if (list.contains(base)) return;
-    list.add(base);
-    onlineSettings.bases.value = list;
-    onlineSettings.save();
-    setState(() {});
-  }
-
-  void _removeBase(int index) {
-    final list = List<String>.from(onlineSettings.bases.value);
-    if (index < 0 || index >= list.length) return;
-    list.removeAt(index);
-    onlineSettings.bases.value = list;
-    if (onlineSettings.selected.value >= list.length) {
-      onlineSettings.selected.value = list.isEmpty ? 0 : list.length - 1;
+  /// 选一个 .js 自定义源脚本，存进设置目录并重新加载。
+  Future<void> _importScript() async {
+    if (_importing) return;
+    setState(() => _importing = true);
+    try {
+      final files = await FilePicker.pickFiles(
+        type: .custom,
+        allowedExtensions: ['js'],
+      );
+      final file = files.firstOrNull;
+      final path = file?.path;
+      if (path == null) return;
+      final script = await File(path).readAsString();
+      if (script.trim().isEmpty) return;
+      await onlineSettings.importScript(script, file!.name);
+      await onlineApiClient.reload();
+      if (!mounted) return;
+      setState(() {});
+    } catch (e) {
+      logger.output('[online] 导入脚本失败: $e');
+    } finally {
+      if (mounted) setState(() => _importing = false);
     }
-    onlineSettings.save();
+  }
+
+  Future<void> _removeScript() async {
+    await onlineSettings.removeScript();
+    await onlineApiClient.reload();
+    if (!mounted) return;
+    setState(() {});
   }
 
   @override
@@ -1922,7 +1919,7 @@ class _SettingsDialogState extends State<_SettingsDialog> {
               Row(
                 children: [
                   const Text(
-                    '接口设置',
+                    '音源设置',
                     style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
                   ),
                   const Spacer(),
@@ -1934,38 +1931,30 @@ class _SettingsDialogState extends State<_SettingsDialog> {
               ),
               const SizedBox(height: 4),
               const Text(
-                '播放时会按顺序尝试这些地址，一个失败自动切下一个。',
+                '播放直链由洛雪音乐的「自定义源」脚本解析，导入一个 .js 即可。',
                 style: TextStyle(fontSize: 12, color: OnlinePalette.textFaint),
               ),
               const SizedBox(height: 14),
-              Flexible(child: _buildBaseList()),
+              Flexible(child: _buildScriptArea()),
               const SizedBox(height: 14),
               Row(
                 children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _newBase,
-                      decoration: const InputDecoration(
-                        hintText: 'https://api.example.com',
-                        isDense: true,
-                      ),
-                      onSubmitted: (value) {
-                        _addBase(value);
-                        _newBase.clear();
-                      },
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  FilledButton(
+                  FilledButton.icon(
                     style: FilledButton.styleFrom(
                       backgroundColor: OnlinePalette.primary,
                       foregroundColor: Colors.white,
                     ),
-                    onPressed: () {
-                      _addBase(_newBase.text);
-                      _newBase.clear();
-                    },
-                    child: const Text('添加'),
+                    onPressed: _importing ? null : _importScript,
+                    icon: const Icon(Icons.file_open_rounded, size: 18),
+                    label: const Text('导入脚本'),
+                  ),
+                  const SizedBox(width: 10),
+                  ValueListenableBuilder<String>(
+                    valueListenable: onlineSettings.scriptName,
+                    builder: (context, name, _) => TextButton(
+                      onPressed: name.isEmpty ? null : _removeScript,
+                      child: const Text('移除'),
+                    ),
                   ),
                 ],
               ),
@@ -2024,81 +2013,59 @@ class _SettingsDialogState extends State<_SettingsDialog> {
     );
   }
 
-  Widget _buildBaseList() {
-    return ValueListenableBuilder<List<String>>(
-      valueListenable: onlineSettings.bases,
-      builder: (context, bases, _) {
-        if (bases.isEmpty) {
+  /// 显示当前脚本与它声明的音源。脚本声明在加载后才拿得到，
+  /// 所以这里顺手触发一次加载。
+  Widget _buildScriptArea() {
+    return ValueListenableBuilder<String>(
+      valueListenable: onlineSettings.scriptName,
+      builder: (context, name, _) {
+        if (name.isEmpty) {
           return const Padding(
             padding: EdgeInsets.symmetric(vertical: 24),
             child: Center(
               child: Text(
-                '还没有接口地址，请添加适配洛雪音乐的api地址',
+                '还没有自定义源脚本，请导入一个 .js',
                 style: TextStyle(color: OnlinePalette.textFaint),
               ),
             ),
           );
         }
-        return ValueListenableBuilder<int>(
-          valueListenable: onlineSettings.selected,
-          builder: (context, selected, _) {
-            return ListView.builder(
+        return FutureBuilder<Map<String, List<String>>>(
+          future: onlineApiClient.fetchSources(),
+          builder: (context, snapshot) {
+            final sources = snapshot.data ?? const {};
+            final text = switch (snapshot.connectionState) {
+              ConnectionState.waiting => '正在加载脚本…',
+              _ when snapshot.hasError => '脚本加载失败：${snapshot.error}',
+              _ when sources.isEmpty => '脚本没有声明可用的音源',
+              _ => '已声明音源：${sources.keys.join('、')}',
+            };
+            return ListView(
               shrinkWrap: true,
-              itemCount: bases.length,
-              itemBuilder: (context, index) {
-                final isSelected = index == selected;
-                return Padding(
-                  padding: const EdgeInsets.only(bottom: 6),
-                  child: Container(
-                    decoration: BoxDecoration(
-                      color: isSelected
-                          ? OnlinePalette.primary.withAlpha(26)
-                          : OnlinePalette.surfaceAlt,
-                      borderRadius: BorderRadius.circular(10),
+              children: [
+                Container(
+                  decoration: BoxDecoration(
+                    color: OnlinePalette.surfaceAlt,
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: ListTile(
+                    dense: true,
+                    leading: const Icon(Icons.javascript_rounded, size: 18),
+                    title: Text(
+                      name,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 13),
                     ),
-                    child: Row(
-                      children: [
-                        IconButton(
-                          tooltip: '使用此地址',
-                          onPressed: () {
-                            onlineSettings.selected.value = index;
-                            onlineSettings.save();
-                          },
-                          icon: Icon(
-                            isSelected
-                                ? Icons.radio_button_checked_rounded
-                                : Icons.radio_button_unchecked_rounded,
-                            color: isSelected
-                                ? OnlinePalette.primaryLight
-                                : OnlinePalette.textFaint,
-                          ),
-                        ),
-                        Expanded(
-                          child: Text(
-                            bases[index],
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 13,
-                              color: isSelected
-                                  ? OnlinePalette.text
-                                  : OnlinePalette.textDim,
-                            ),
-                          ),
-                        ),
-                        IconButton(
-                          tooltip: '删除',
-                          onPressed: () => _removeBase(index),
-                          icon: const Icon(
-                            Icons.delete_outline_rounded,
-                            size: 18,
-                            color: OnlinePalette.danger,
-                          ),
-                        ),
-                      ],
+                    subtitle: Text(
+                      text,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: OnlinePalette.textFaint,
+                      ),
                     ),
                   ),
-                );
-              },
+                ),
+              ],
             );
           },
         );

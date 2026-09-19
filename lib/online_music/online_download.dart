@@ -20,7 +20,7 @@ import 'package:sylvakru/base/services/logger.dart';
 import 'package:sylvakru/online_music/online_music_api.dart';
 
 enum OnlineDownloadState {
-  /// 正在向聚合接口解析播放直链。
+  /// 正在由自定义源脚本解析播放直链。
   resolving,
   enqueued,
   running,

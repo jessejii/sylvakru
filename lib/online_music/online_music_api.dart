@@ -1,15 +1,13 @@
-// 聚合音源客户端 + 搜索器 + 本地设置。
+// 在线音乐：搜索器 + 本地设置 + 播放直链解析。
 //
-// 协议来源（lx-music「自定义源」）：
-//   https://ghproxy.net/raw.githubusercontent.com/pdone/lx-music-source/main/juhe/latest.js
+// 直链解析不再复刻某个具体接口，而是直接跑 lx-music 的「自定义源」脚本：
+// Dart 复刻宿主注入的 `window.lx`，用 QuickJS 原样执行用户 JS（见 lx_js/）。
+// 脚本怎么取链是脚本自己的事（聚合接口、303 二次校验……），这里只做三件事：
+//   1. 等脚本 `lx.send('inited')`，拿到它声明的音源与音质
+//   2. 把歌曲对象（lx 旧格式）交给脚本的 request 事件
+//   3. 校验脚本返回的直链是 http(s) 且长度合规
 //
-// 那个脚本只有两步：
-//   1. GET  {base}/init.conf        —— 拿音源清单与可用音质
-//   2. POST {base}/{source}         —— body 是 {"type": "<音质>", "musicInfo": <旧格式歌曲对象>}
-//      返回 code:200 直接取 data.url；code:303 需要按服务端给的 url 再请求一次做校验。
-// 这里等价复刻，不引入 JS 运行时（脚本本身没有加密/混淆）。
-//
-// 该脚本只注册了 request 事件，**不提供搜索**，所以搜索由本文件的两个
+// 自定义源脚本只注册 request 事件、**不提供搜索**，所以搜索仍由本文件的两个
 // Searcher 按 lx-music 内置实现的接口与解析规则自己实现。
 
 import 'dart:async';
@@ -22,6 +20,8 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:sylvakru/base/app.dart';
 import 'package:sylvakru/base/services/logger.dart';
+import 'package:sylvakru/online_music/lx_js/lx_js_bridge.dart';
+import 'package:sylvakru/online_music/lx_js/lx_js_source.dart';
 
 /// 接口地址默认留空：必须由用户在「接口设置」里手动填写自己的洛雪音乐接口，
 /// 不再内置任何默认地址。
@@ -234,12 +234,14 @@ class OnlinePlaylist {
 // 本地设置
 // ---------------------------------------------------------------------------
 
-/// 在线音乐的本地设置：接口地址列表、当前选中项、默认音质。
+/// 在线音乐的本地设置：自定义源脚本、默认音质、下载目录。
 class OnlineSettings {
   static const String _fileName = 'online_music_settings.json';
 
-  final ValueNotifier<List<String>> bases = ValueNotifier(const []);
-  final ValueNotifier<int> selected = ValueNotifier(0);
+  /// 脚本正文单独存文件：脚本动辄几十 KB，塞进设置 JSON 不好读也不好改。
+  static const String _scriptFileName = 'online_music_script.js';
+
+  final ValueNotifier<String> scriptName = ValueNotifier('');
   final ValueNotifier<String> quality = ValueNotifier('128k');
 
   /// 下载目录。存 URI 字符串：桌面是 `file://`，Android 是 `content://`，
@@ -248,20 +250,42 @@ class OnlineSettings {
 
   File get _file => File('${appSupportDir.path}/$_fileName');
 
+  File get _scriptFile => File('${appSupportDir.path}/$_scriptFileName');
+
+  bool get hasScript => scriptName.value.isNotEmpty && _scriptFile.existsSync();
+
+  /// 已导入的脚本正文；没导入过就是空串。
+  String get script {
+    if (!hasScript) return '';
+    try {
+      return _scriptFile.readAsStringSync();
+    } catch (e) {
+      logger.output('[online] 脚本读取失败: $e');
+      return '';
+    }
+  }
+
+  /// 导入脚本：写入脚本文件并记住名字。
+  Future<void> importScript(String source, String name) async {
+    await _scriptFile.writeAsString(source);
+    scriptName.value = name;
+    await save();
+  }
+
+  Future<void> removeScript() async {
+    if (_scriptFile.existsSync()) {
+      await _scriptFile.delete();
+    }
+    scriptName.value = '';
+    await save();
+  }
+
   Future<void> load() async {
     try {
       final file = _file;
       if (!file.existsSync()) return;
       final map = _asMap(jsonDecode(await file.readAsString()));
-      final list = (map['bases'] as List?)
-          ?.map((e) => '$e'.trim())
-          .where((e) => e.isNotEmpty)
-          .toList();
-      if (list != null && list.isNotEmpty) bases.value = list;
-      selected.value = ((map['selected'] as num?)?.toInt() ?? 0).clamp(
-        0,
-        bases.value.length - 1,
-      );
+      scriptName.value = map['scriptName'] as String? ?? '';
       quality.value = map['quality'] as String? ?? '128k';
       downloadDir.value = map['downloadDir'] as String? ?? '';
     } catch (e) {
@@ -273,8 +297,7 @@ class OnlineSettings {
     try {
       await _file.writeAsString(
         jsonEncode({
-          'bases': bases.value,
-          'selected': selected.value,
+          'scriptName': scriptName.value,
           'quality': quality.value,
           'downloadDir': downloadDir.value,
         }),
@@ -282,14 +305,6 @@ class OnlineSettings {
     } catch (e) {
       logger.output('[online] 设置写入失败: $e');
     }
-  }
-
-  /// 当前生效的接口地址：选中的排最前，其余依次兜底。
-  List<String> get orderedBases {
-    final list = bases.value;
-    if (list.isEmpty) return const [];
-    final current = list[selected.value.clamp(0, list.length - 1)];
-    return [current, ...list.where((base) => base != current)];
   }
 }
 
@@ -754,43 +769,36 @@ class MgSearcher implements OnlineSearcher {
 }
 
 // ---------------------------------------------------------------------------
-// 聚合接口客户端
+// 直链解析：交给自定义源脚本
 // ---------------------------------------------------------------------------
 
 class OnlineApiClient {
-  /// base -> (source -> 可用音质)。接口声明不会频繁变，进程内缓存即可。
-  final Map<String, Map<String, List<String>>> _sourceCache = {};
-
   /// `source|songmid|quality` -> 直链。
   /// ponytail: 只放内存、上限 200 条；重启失效可接受，真要跨进程复用再落盘。
   final Map<String, String> _urlCache = {};
   static const int _urlCacheLimit = 200;
 
-  /// 拉取某个接口地址声明的音源与音质。
-  Future<Map<String, List<String>>> fetchSources(String base) async {
-    final cached = _sourceCache[base];
-    if (cached != null) return cached;
-
-    final response = await _get(Uri.parse('$base/init.conf'));
-    final json = _asJsonObject(_decodeBody(response.bodyBytes), '接口初始化');
-    if (json['code'] != 200) {
-      throw OnlineApiException('接口初始化失败（code=${json['code']}）');
-    }
-    final sources = _asMap(_asMap(_asMap(json['data'])['init'])['sources']);
-    final result = <String, List<String>>{};
-    for (final entry in sources.entries) {
-      final info = _asMap(entry.value);
-      if (info['type'] != 'music') continue;
-      final actions = (info['actions'] as List?)?.map((e) => '$e') ?? const [];
-      if (!actions.contains('musicUrl')) continue;
-      result[entry.key] =
-          (info['qualitys'] as List?)?.map((e) => '$e').toList() ?? const [];
-    }
-    _sourceCache[base] = result;
-    return result;
+  /// 脚本声明的音源 -> 可用音质。已经跑起来就直接返回缓存。
+  Future<Map<String, List<String>>> fetchSources() async {
+    final sources = await _ensureLoaded();
+    return sources.map((source, info) => MapEntry(source, info.qualitys));
   }
 
-  /// 解析播放直链。按设置里的地址顺序轮询，全部失败才抛错。
+  Future<Map<String, LxSourceInfo>> _ensureLoaded() async {
+    if (lxJsSources.isReady) return lxJsSources.sources;
+    final script = onlineSettings.script;
+    if (script.isEmpty) return const {};
+    try {
+      return await lxJsSources.load(
+        script: script,
+        meta: LxScriptMeta(name: onlineSettings.scriptName.value),
+      );
+    } on LxJsException catch (e) {
+      throw OnlineApiException(e.message);
+    }
+  }
+
+  /// 解析播放直链：把歌曲对象交给脚本的 request 事件。
   Future<String> resolveUrl({
     required OnlineTrack track,
     required String quality,
@@ -799,159 +807,32 @@ class OnlineApiClient {
     final cached = _urlCache[cacheKey];
     if (cached != null) return cached;
 
-    final bases = onlineSettings.orderedBases;
-    if (bases.isEmpty) {
-      throw OnlineApiException('还没有配置接口地址，请先在设置里添加');
+    final sources = await _ensureLoaded();
+    if (sources.isEmpty) {
+      throw OnlineApiException('还没有导入自定义源脚本，请在「音源设置」里导入');
+    }
+    if (sources[track.source] == null) {
+      throw OnlineApiException('自定义源脚本不支持音源 ${track.source}');
     }
 
-    OnlineApiException? lastError;
-    // ponytail: 地址之间线性轮询。地址数 < 10，不值得做并发探测或健康检查。
-    for (final base in bases) {
-      try {
-        final url = await _resolveVia(base, track, quality);
-        _cacheUrl(cacheKey, url);
-        return url;
-      } on OnlineApiException catch (e) {
-        lastError = e;
-        logger.output(
-          '[online] $base ${track.source} ${track.name} 解析失败: ${e.message}',
-        );
-      }
-    }
-    throw OnlineApiException(lastError?.message ?? '全部接口地址都不可用');
-  }
-
-  Future<String> _resolveVia(
-    String base,
-    OnlineTrack track,
-    String quality,
-  ) async {
-    final body = utf8.encode(
-      jsonEncode({'type': quality, 'musicInfo': track.toMusicInfo()}),
-    );
-    final http.Response response;
     try {
-      response = await http
-          .post(
-            Uri.parse('$base/${track.source}'),
-            headers: const {'Content-Type': 'application/json'},
-            body: body,
-          )
-          .timeout(_requestTimeout);
-    } on TimeoutException {
-      throw OnlineApiException('请求超时');
-    } on SocketException catch (e) {
-      throw OnlineApiException('网络不可达：${e.osError?.message ?? '连接失败'}');
-    } on http.ClientException catch (e) {
-      throw OnlineApiException('网络异常：${e.message}');
+      final url = await lxJsSources.getMusicUrl(
+        track.source,
+        track.toMusicInfo(),
+        quality,
+      );
+      _cacheUrl(cacheKey, url);
+      return url;
+    } on LxJsException catch (e) {
+      logger.output('[online] ${track.source} ${track.name} 解析失败: ${e.message}');
+      throw OnlineApiException(e.message);
     }
-
-    if (response.statusCode != 200) {
-      throw OnlineApiException('HTTP ${response.statusCode}');
-    }
-
-    final json = _asJsonObject(_decodeBody(response.bodyBytes), '解析接口');
-    final code = json['code'];
-    if (code == 200) {
-      return _checkUrl(_asMap(json['data'])['url']);
-    }
-    if (code == 303) {
-      return _resolveIndirect(_asMap(json['data']));
-    }
-    throw OnlineApiException('${json['msg'] ?? '接口返回未知状态 $code'}');
   }
 
-  /// 复刻脚本的 303 分支：先请求服务端给的 url，按 `response.check.key` 逐层
-  /// 取值与 `check.value` 比对，通过后再按 `response.url` 逐层取值。
-  Future<String> _resolveIndirect(Map<String, dynamic> data) async {
-    final request = _asMap(data['request']);
-    final response = _asMap(data['response']);
-
-    final rawUrl = '${request['url'] ?? ''}';
-    if (rawUrl.isEmpty) throw OnlineApiException('303 响应缺少 request.url');
-
-    final options = _asMap(request['options']);
-    final headers = _asMap(options['headers']).map(
-      (key, value) => MapEntry(key.toString(), value.toString()),
-    );
-    final method = '${options['method'] ?? 'GET'}'.toUpperCase();
-
-    final uri = Uri.parse(Uri.encodeFull(rawUrl));
-    late final http.Response second;
-    try {
-      final future = method == 'POST'
-          ? http.post(uri, headers: headers)
-          : http.get(uri, headers: headers);
-      second = await future.timeout(_requestTimeout);
-    } on TimeoutException {
-      throw OnlineApiException('二次请求超时');
-    } on SocketException catch (e) {
-      throw OnlineApiException('二次请求网络不可达：${e.osError?.message ?? ''}');
-    } on http.ClientException catch (e) {
-      throw OnlineApiException('二次请求失败：${e.message}');
-    }
-
-    final body = _decodeBody(second.bodyBytes);
-    // 对应脚本里传给 check/url 求值的那个 response 对象。
-    final envelope = <String, dynamic>{
-      'statusCode': second.statusCode,
-      'headers': second.headers,
-      'raw': body,
-      'body': _tryDecodeJson(body),
-    };
-
-    final check = _asMap(response['check']);
-    final checkKeys = (check['key'] as List?) ?? const [];
-    if (checkKeys.isEmpty) throw OnlineApiException('303 响应缺少 check.key');
-    final actual = digNested(envelope, checkKeys);
-    final expected = check['value'];
-    if ('$actual' != '$expected') {
-      throw OnlineApiException(_describeFailure(envelope, actual));
-    }
-
-    final urlKeys = (response['url'] as List?) ?? const [];
-    if (urlKeys.isEmpty) throw OnlineApiException('303 响应缺少 response.url');
-    return _checkUrl(digNested(envelope, urlKeys));
-  }
-
-  /// 解析被服务端拒绝时，优先把服务端自己的话带给用户。
-  /// 例：咪咕对解不了的曲目回 `{"code":"201007","info":"请求失败，请稍候再试"}`。
-  static String _describeFailure(Map<String, dynamic> envelope, Object? code) {
-    final body = _asMap(envelope['body']);
-    final reason = body['info'] ?? body['msg'] ?? body['message'];
-    if (reason is String && reason.isNotEmpty) return '$reason（$code）';
-    return '接口拒绝了这次解析（$code）';
-  }
-
-  /// 对应脚本里的 `keys.reduce((a, c) => a && a[c], obj)`：逐层下钻，
-  /// 中途不是 Map 就直接返回 null。
-  static Object? digNested(Object? node, List<dynamic> keys) {
-    Object? current = node;
-    for (final key in keys) {
-      if (current is Map) {
-        current = current[key.toString()];
-      } else {
-        return null;
-      }
-    }
-    return current;
-  }
-
-  /// 与宿主一致：直链必须是 http(s) 且长度受限。
-  static String _checkUrl(Object? value) {
-    final url = value?.toString() ?? '';
-    if (!RegExp(r'^https?://').hasMatch(url) || url.length > 2048) {
-      throw OnlineApiException('解析到的播放直链不合法');
-    }
-    return url;
-  }
-
-  static Object? _tryDecodeJson(String body) {
-    try {
-      return jsonDecode(body);
-    } on FormatException {
-      return body;
-    }
+  /// 脚本变了就重新加载（导入新脚本后调用）。
+  Future<void> reload() async {
+    await lxJsSources.unload();
+    _urlCache.clear();
   }
 
   void _cacheUrl(String key, String url) {
